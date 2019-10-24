@@ -1,0 +1,431 @@
+//Mosaico meiode
+//https://www.mdpi.com/2072-4292/5/12/6481/htm
+
+
+//Parámetros
+var fecha1 = ee.Date('2018-05-01');
+var fecha2 = ee.Date('2018-11-30');
+var timebufferBefore = 1
+var timebufferAfter = 1;
+var topoCorrection = 'ERM';
+var cloudcoverMetadata= 30;
+var contractPixels = 0;
+var dilatePixels = 2;
+var Honduras = ee.FeatureCollection ("ft:1rpd6kIewFWHrgX84jKwW30jeazmuiQJgXg-Pv759").geometry();
+var studyArea = Honduras;
+var useLandsat7 = 'true';
+
+
+//Colecciones Landsat
+//Surface Reflectance Tier 1
+var Landsat5t1 = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR');
+var Landsat7t1 = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR');
+var Landsat8t1 = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR');
+
+//Surface Reflectance Tier 2
+var Landsat5t2 = ee.ImageCollection('LANDSAT/LT05/C01/T2_SR');
+var Landsat7t2 = ee.ImageCollection('LANDSAT/LE07/C01/T2_SR');
+var Landsat8t2 = ee.ImageCollection('LANDSAT/LC08/C01/T2_SR');
+
+var Landsat5t1t2 = Landsat5t1.merge(Landsat5t2);
+var Landsat7t1t2 = Landsat7t1.merge(Landsat7t2);
+var Landsat8t1t2 = Landsat8t1.merge(Landsat8t2);
+
+
+
+//Funciones
+
+//Filtros de Fechas y Lugar
+function fechaLugar(imagecollection) {
+  fecha1 = fecha1.advance(-(timebufferBefore),'year');
+  fecha2 = fecha2.advance(timebufferAfter,'year');
+  var fecha1doy = fecha1.getRelative( 'day', 'year');
+  var fecha2doy = fecha2.getRelative( 'day', 'year');
+  var filtro = imagecollection
+  .filterDate(fecha1,fecha2)
+  .filterBounds(studyArea)
+  .filter(ee.Filter.calendarRange(fecha1doy,fecha2doy,'day_of_year'))
+  .filterMetadata('CLOUD_COVER_LAND','less_than', cloudcoverMetadata)
+  //.filterMetadata('SOLAR_AZIMUTH','less_than', sun_az_max)
+  //.filterMetadata('SOLAR_AZIMUTH','greater_than', sun_az_min);
+  return filtro}
+
+//Normalizacion de nombres
+function changeBandNameL5L7(image) {
+  return image.select(
+  ['B1','B2', 'B3', 'B4', 'B5', 'B7','pixel_qa','sr_atmos_opacity'],  
+  ['blue', 'green', 'red', 'nir', 'swir1', 'swir2','cfmask','atmos_opacity'])}
+  
+function changeBandNameL8(image) {
+  return image.select(
+  ['B2', 'B3', 'B4', 'B5', 'B6', 'B7','pixel_qa'],  
+  ['blue', 'green', 'red', 'nir', 'swir1', 'swir2','cfmask'])}
+
+
+//Funcion enmascaramineto nubes y sombras
+function maskcloudBand(image) {
+  var qa = image.select('cfmask');
+  var maskCloudsShadow = qa.bitwiseAnd(8).eq(0).and(                                 // include shadow
+                         qa.bitwiseAnd(32).eq(0));                                   // include clouds
+    maskCloudsShadow = maskCloudsShadow.focal_max(dilatePixels);
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  var resultado = image
+  .updateMask(maskCloudsShadow).updateMask(mask2);
+  return resultado}
+
+//Enmascarar bruma (haze)
+function mascaraHaze(image) {
+  var maskHaze = function (image) {
+    var haze = image.select('atmos_opacity').lt(3000);
+    var resultado = image.updateMask(haze).select('blue', 'green', 'red', 'nir', 'swir1', 'swir2','cfmask','index','zenith','azimuth');
+    return resultado};
+  var id = ee.String(image.get('LANDSAT_ID'));
+  var idSatelite= ee.Number.parse(id.slice(3,4));
+  var true1 = maskHaze(image);
+  var false1 = image;
+  var resultado = ee.Image(ee.Algorithms.If(idSatelite.lte(7), true1, false1));
+  return resultado}
+
+//Funcion agregar fecha y sensor
+function indexBand(image) {
+  var id = ee.String(image.get('LANDSAT_ID'));
+  var idSatelite= id.slice(3,4);
+  var idFecha = id.slice(17,25);
+  var index = ee.Number.parse(ee.String(idSatelite.cat(idFecha)));
+  //var index = ee.Number.parse(ee.String(idFecha));
+  var resultado = ee.Image(index).int32().clip(image.geometry()).rename('index');
+  return image.addBands(resultado);
+}
+
+//Agregar zenith y azimuth
+function addZenithAzimuth(img){
+  var zenith = ee.Image.constant(img.get('SOLAR_ZENITH_ANGLE'))
+    .float().rename('zenith');
+  
+  var azimuth = ee.Image.constant(img.get('SOLAR_AZIMUTH_ANGLE'))
+    .float().rename('azimuth');
+    
+  return img.addBands(zenith).addBands(azimuth);}
+
+//Kernel for masking fringes found and L5 and L7 imagery
+var k = ee.Kernel.fixed(41, 41, 
+[[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
+);
+
+
+//Algoritmo para enmascarar bordes franjas en L5 y L7
+function defringeLandsat(img){
+  //Find any pixel without
+  var m = img.mask().reduce(ee.Reducer.min());
+  var sum = m.reduceNeighborhood(ee.Reducer.sum(), k, 'kernel')
+  sum = sum.gte(279)
+  img = img.mask(img.mask().and(sum))
+  return img;
+}
+
+
+//Funcion obtener listado de imagenes diferentes
+function usedIds(image) {
+  var segments = image.select('index').reduceToVectors({
+    scale: 30,
+    bestEffort: true,
+    maxPixels: 1e5,
+    tileScale: 16,
+    geometry: studyArea,
+    geometryType: "centroid",
+    labelProperty: 'index'
+  });
+  var usedIndexes = ee.List(segments.distinct('index').aggregate_array('index'));
+  return usedIndexes}
+
+//Funcion de normalizacion l8/l7
+//Written by Yang Z.
+//------ L8 to L7 HARMONIZATION FUNCTION -----
+// slope and intercept citation: Roy, D.P., Kovalskyy, V., Zhang, H.K., Vermote, E.F., Yan, L., Kumar, S.S, Egorov, A., 2016, Characterization of Landsat-7 to Landsat-8 reflective wavelength and normalized difference vegetation index continuity, Remote Sensing of Environment, 185, 57-70.(http://dx.doi.org/10.1016/j.rse.2015.12.024); Table 2 - reduced major axis (RMA) regression coefficients
+function harmonizationRoy (oli) {
+  var props = oli.toDictionary()
+  var slopes = ee.Image.constant([0.9785, 0.9542, 0.9825, 1.0073, 1.0171, 0.9949]);        // create an image of slopes per band for L8 TO L7 regression line - David Roy
+  var itcp = ee.Image.constant([-0.0095, -0.0016, -0.0022, -0.0021, -0.0030, 0.0029]);     // create an image of y-intercepts per band for L8 TO L7 regression line - David Roy
+  var y = oli.select('blue', 'green', 'red', 'nir', 'swir1', 'swir2') // select OLI bands 2-7 and rename them to match L7 band names
+              .resample('bicubic')                                                          // ...resample the L8 bands using bicubic
+             .subtract(itcp.multiply(10000)).divide(slopes)                                // ...multiply the y-intercept bands by 10000 to match the scale of the L7 bands then apply the line equation - subtract the intercept and divide by the slope
+             .set('system:time_start', oli.get('system:time_start'));                    // ...set the output system:time_start metadata to the input image time_start otherwise it is null
+  var x = y.toShort();                                                                       // return the image as short to match the type of the other data
+  var resultado = x.addBands(oli.select('cfmask', 'index','zenith','azimuth')).setMulti(props);
+  //var resultado = oli.select('cfmask', 'index').addBands(x).setMulti(props);
+  return resultado;                                                                       
+}
+
+//Funcion para calculo de mosaicos meiodes
+// Function for computing the mean squared difference medoid from an image 
+// collection
+function medoidMosaicMSD(inCollection,medoidIncludeBands) {
+  // Find band names in first image
+  var f = ee.Image(inCollection.first());
+  var bandNames = f.bandNames();
+  var bandNumbers = ee.List.sequence(1,bandNames.length());
+  
+  if (medoidIncludeBands === undefined || medoidIncludeBands === null) {
+    medoidIncludeBands = bandNames;
+  }
+  // Find the median
+  var median = inCollection.select(medoidIncludeBands).median();
+  
+  // Find the squared difference from the median for each image
+  var medoid = inCollection.map(function(img){
+    var diff = ee.Image(img).select(medoidIncludeBands).subtract(median)
+      .pow(ee.Image.constant(2));
+    return diff.reduce('sum').addBands(img);
+  });
+  
+  // Minimize the distance across all bands
+  medoid = ee.ImageCollection(medoid)
+    .reduce(ee.Reducer.min(bandNames.length().add(1)))
+    .select(bandNumbers,bandNames);
+
+  return medoid;
+}
+
+//Funciones Correccion Topografica
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Function to calculate illumination condition (IC). Function by Patrick Burns 
+// (pb463@nau.edu) and Matt Macander 
+// (mmacander@abrinc.com)
+function illuminationCondition(img){
+  // Extract solar zenith and azimuth bands
+  var SZ_rad = img.select('zenith').multiply(Math.PI).divide(180).float();
+  var SA_rad = img.select('azimuth').multiply(Math.PI).divide(180).float();
+  
+  // Creat terrain layers
+  var dem = ee.Image('USGS/SRTMGL1_003');
+  var slp = ee.Terrain.slope(dem);
+  var slp_rad = ee.Terrain.slope(dem).multiply(Math.PI).divide(180);
+  var asp_rad = ee.Terrain.aspect(dem).multiply(Math.PI).divide(180);
+  
+  // Calculate the Illumination Condition (IC)
+  // slope part of the illumination condition
+  var cosZ = SZ_rad.cos();
+  var cosS = slp_rad.cos();
+  var slope_illumination = cosS.expression("cosZ * cosS", 
+                                          {'cosZ': cosZ,
+                                           'cosS': cosS.select('slope')});
+  // aspect part of the illumination condition
+  var sinZ = SZ_rad.sin(); 
+  var sinS = slp_rad.sin();
+  var cosAziDiff = (SA_rad.subtract(asp_rad)).cos();
+  var aspect_illumination = sinZ.expression("sinZ * sinS * cosAziDiff", 
+                                           {'sinZ': sinZ,
+                                            'sinS': sinS,
+                                            'cosAziDiff': cosAziDiff});
+  // full illumination condition (IC)
+  var ic = slope_illumination.add(aspect_illumination);
+
+  // Add IC to original image
+  return img.addBands(ic.rename('IC'))
+    .addBands(cosZ.rename('cosZ'))
+    .addBands(cosS.rename('cosS'))
+    .addBands(slp.rename('slope'));
+}
+
+// Function to apply the Sun-Canopy-Sensor + C (SCSc) correction method to each 
+// image. Function by Patrick Burns (pb463@nau.edu) and Matt Macander 
+// (mmacander@abrinc.com)
+function illuminationCorrection(img){
+  var studyArea = img.geometry()
+  var bandList = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']
+  var props = img.toDictionary();
+  var st = img.get('system:time_start');
+  var img_plus_ic = img;
+  var mask2 = img_plus_ic.select('slope').gte(5)
+    .and(img_plus_ic.select('IC').gte(0))
+    .and(img_plus_ic.select('nir').gt(-0.1));
+  var img_plus_ic_mask2 = ee.Image(img_plus_ic.updateMask(mask2));
+  
+  // Specify Bands to topographically correct  
+  var compositeBands = img.bandNames();
+  var nonCorrectBands = img.select(compositeBands.removeAll(bandList));
+  
+  function apply_topoCorr(bandList){
+    var method = 'SCSc';
+    var out = img_plus_ic_mask2.select('IC', bandList).reduceRegion({
+      reducer: ee.Reducer.linearFit(),
+      geometry: studyArea,
+      scale: 30,
+      maxPixels: 1e13
+    }); 
+    var out_a = ee.Number(out.get('scale'));
+    var out_b = ee.Number(out.get('offset'));
+    var out_c = out_b.divide(out_a);
+    
+    
+   if  (topoCorrection == 'ERM') {    
+     //Apply Tan et al., (2010) empirical rotation model
+    var erm_tanEtAl = img_plus_ic_mask2.expression(
+    'image - (a * (ic - cosz))',{
+      'image': img_plus_ic_mask2.select(bandList),
+      'cosz':  img_plus_ic_mask2.select('cosZ'),
+      'ic': img_plus_ic_mask2.select('IC'),
+      'a': out_a,
+  })
+     
+  return erm_tanEtAl;
+   } 
+   else {
+   
+   // Apply the SCSc correction
+    var SCSc_output = img_plus_ic_mask2.expression(
+      "((image * (cosB * cosZ + cvalue)) / (ic + cvalue))", {
+      'image': img_plus_ic_mask2.select(bandList),
+      'ic': img_plus_ic_mask2.select('IC'),
+      'cosB': img_plus_ic_mask2.select('cosS'),
+      'cosZ': img_plus_ic_mask2.select('cosZ'),
+      'cvalue': out_c
+    }) 
+  return SCSc_output;
+   }
+  }
+  
+  var img_topoCorr = ee.Image(bandList.map(apply_topoCorr)).uint16()
+    .addBands(img_plus_ic.select('IC'));
+  var bandList_IC = ee.List([bandList, 'IC']).flatten();
+  img_topoCorr = img_topoCorr.unmask(img_plus_ic.select(bandList_IC)).select(bandList);
+  
+  return img_topoCorr.addBands(nonCorrectBands)
+    .setMulti(props)
+    .set('system:time_start',st);
+}
+
+//Aplicacion de funciones
+//Helpers
+var date2 = ee.Number(ee.Date(fecha2).millis());
+var landsat5off = ee.Number(ee.Date('2012-05-05').millis());
+var landsat8on = ee.Number(ee.Date('2013-04-11').millis());
+
+
+if(date2.gt(landsat5off)){
+var filtro1 = fechaLugar(Landsat5t1);
+var coleccionNombres1 = changeBandNameL5L7 (filtro1);
+var coleccionIndex1 = coleccionNombres1.map(indexBand);
+var coleccion5AZ = coleccionIndex1.map(addZenithAzimuth);
+var colleccion5Bordes = coleccion5AZ.map(defringeLandsat);
+var coleccionSinHaze5 = colleccion5Bordes.map(mascaraHaze);
+var coleccionsinNubesSombras5 = coleccionSinHaze5.map(maskcloudBand);}
+
+if (date2.gt(landsat8on)){
+var filtro3 = fechaLugar(Landsat8t1);
+var coleccionNombres3 = changeBandNameL8(filtro3);
+var coleccionIndex3 = coleccionNombres3.map(indexBand);
+var coleccion8AZ = coleccionIndex3.map(addZenithAzimuth);
+var coleccioNormalizada8 = coleccion8AZ.map(harmonizationRoy);
+var coleccionsinNubesSombras8 = coleccioNormalizada8.map(maskcloudBand);}
+
+
+if(useLandsat7 === 'true'){
+var filtro2 = fechaLugar(Landsat7t1);
+var coleccionNombres2 = changeBandNameL5L7 (filtro2);
+var coleccionIndex2 = coleccionNombres2.map(indexBand);
+var coleccion7AZ = coleccionIndex2.map(addZenithAzimuth);
+var colleccion7Bordes = coleccion7AZ.map(defringeLandsat);
+var coleccionSinHaze7 = colleccion7Bordes.map(mascaraHaze);
+var coleccionsinNubesSombras7 = coleccionSinHaze7.map(maskcloudBand);}
+else{var coleccionsinNubesSombras7 = Landsat7t1
+  .filterDate('1993-03-22','1994-03-19')}
+
+
+//Unir colecciones
+var unionColecciones = ee.ImageCollection (coleccionsinNubesSombras5.merge(coleccionsinNubesSombras7).merge(coleccionsinNubesSombras8));
+
+//Composicion mosaico meiode
+var bandasIncluidas = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
+var mosaicoMeiode = medoidMosaicMSD (unionColecciones,bandasIncluidas);
+
+//Corte
+var medoidClip = mosaicoMeiode.clip(studyArea);
+
+//Aplicacion de correccion topografica
+//var medoidClipTopo = ee.Image(illuminationCorrection(illuminationCondition(medoidClip)))
+
+
+//Visualizacion
+Map.addLayer(ee.Image().paint(studyArea,1,1), {'palette': '00FFFF'},'Area de Estudio');
+var visSWNIRRED = {bands: ['nir','swir1','red'], min: [0,0,0], max: [6500, 6500, 5500]};
+Map.addLayer(medoidClip, visSWNIRRED, 'Mosaico Meiode');
+//Map.addLayer(medoidClip.select('index'), {}, 'Mosaico Meiode fecha');
+//Map.addLayer(medoidClipTopo, visSWNIRRED, 'Mosaico Meiode Topo');
+
+//Lista imágenes
+var lista = usedIds(medoidClip);
+
+print(medoidClip,lista);
+
+// Agregar metadatos
+    var year = fecha2.get('year');
+    var startJulian = fecha1.getRelative('day','year');
+    var endJulian = fecha2.getRelative('day','year');
+    var composite = medoidClip.set({
+      'system:time_start': ee.Date.fromYMD(year,6,1).millis(),
+      'source': 'SR',
+      'timebufferBefore':timebufferBefore,
+      'timebufferAfter':timebufferAfter,
+      'startJulian': startJulian,
+      'endJulian': endJulian,
+      'compositingMethod': 'Medoid',
+      'cloudcoverMetadata':cloudcoverMetadata.toString(),
+      'includeL7': useLandsat7.toString(),
+      //'topoCorrection': topoCorrection
+    });
+
+
+
+//Export to asset
+Export.image.toAsset(
+  {image:composite.select(['blue', 'green', 'red', 'nir', 'swir1', 'swir2','zenith','azimuth']), 
+  description: 'Medoid_Palmar_2015', 
+  region:studyArea.bounds(), 
+  scale:30,
+  maxPixels: 1e12})
+
+print(coleccionsinNubesSombras5,coleccionsinNubesSombras8,coleccionsinNubesSombras7,unionColecciones,composite)
+
