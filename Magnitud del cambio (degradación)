@@ -1,0 +1,86 @@
+Estable = Estable.map(function(f) {
+  return f.set('clase', 0);
+});
+
+var Honduras = ee.FeatureCollection ("ft:1rpd6kIewFWHrgX84jKwW30jeazmuiQJgXg-Pv759");
+var studyArea = Honduras.geometry();
+//máscaras de cobertura Bosque y NO bosque del año 2005
+var Bosque_00_18 = B_estable_00_18.eq(1);
+
+
+//Máscaras de mosaicos Landsat
+var Mask_Bosque_2000 = M_T_2000.mask(Bosque_00_18);
+var Mask_Bosque_2018 = M_T_2018.mask(Bosque_00_18);
+
+//selección de bandas de los sensores
+var my_band_names = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6'];   
+var Bnds00 = function(image) {return image.select(['blue', 'green', 'red', 'nir', 'swir1', 'swir2'], my_band_names);};
+var Bnds18 = function(image) {return image.select(['blue', 'green', 'red', 'nir', 'swir1', 'swir2'], my_band_names);};
+
+//Aplicación de nombres
+var mask_Bosque_2000 = Bnds00(Mask_Bosque_2000);
+var mask_Bosque_2018 = Bnds18(Mask_Bosque_2018);
+
+//Create image ratio bands
+var rat45_00 = mask_Bosque_2000.select("B4").divide(mask_Bosque_2000.select("B5"));
+var rat46_00 = mask_Bosque_2000.select("B4").divide(mask_Bosque_2000.select("B6"));
+var rat47_00 = mask_Bosque_2000.select("B4").divide(mask_Bosque_2000.select("B3"));
+var rat56_00 = mask_Bosque_2000.select("B5").divide(mask_Bosque_2000.select("B6"));
+var rat57_00 = mask_Bosque_2000.select("B5").divide(mask_Bosque_2000.select("B3"));
+var rat67_00 = mask_Bosque_2000.select("B6").divide(mask_Bosque_2000.select("B3"));
+                    
+var rat45_18 = mask_Bosque_2018.select("B4").divide(mask_Bosque_2018.select("B5"));
+var rat46_18 = mask_Bosque_2018.select("B4").divide(mask_Bosque_2018.select("B6"));
+var rat47_18 = mask_Bosque_2018.select("B4").divide(mask_Bosque_2018.select("B3"));
+var rat56_18 = mask_Bosque_2018.select("B5").divide(mask_Bosque_2018.select("B6"));
+var rat57_18 = mask_Bosque_2018.select("B5").divide(mask_Bosque_2018.select("B3"));
+var rat67_18 = mask_Bosque_2018.select("B6").divide(mask_Bosque_2018.select("B3"));
+
+//Add the ratio bands
+var m2000_rat = mask_Bosque_2000.addBands(rat45_00).addBands(rat46_00).addBands(rat47_00).addBands(rat56_00).addBands(rat57_00).addBands(rat67_00);
+var m2018_rat = mask_Bosque_2018.addBands(rat45_18).addBands(rat46_18).addBands(rat47_18).addBands(rat56_18).addBands(rat57_18).addBands(rat67_18);
+
+//Mosaico Multifechas para bosque 2012 de la biósfera
+var m00_18_multifecha = m2000_rat.addBands(m2018_rat);
+
+//2. NOMBRAMIENTO Y SEPARACIÓN DE BANDAS
+var Nombre_bandas = m00_18_multifecha.bandNames();
+
+//3. UNIR LAS COLECCIONES DE MUESTRAS 
+var Muestras = Estable.randomColumn()
+               .merge(Degradacion.randomColumn());
+               
+//4. REGIONES DE ENTRENAMIENTO 
+var regiones_entrenamiento = m00_18_multifecha.reduceRegions({
+                             collection: Muestras,
+                             reducer: 'median',
+                             scale: 1000});
+                             
+//4.1. EXCLUIR VALORES NULOS DE ALGUNAS CAPAS
+regiones_entrenamiento = regiones_entrenamiento.filter(
+                         ee.Filter.and(
+                         ee.Filter.neq('B1', null),
+                         ee.Filter.neq('B2', null)
+                         ));
+                             
+// 5 ENTRENAR CON UN CLAFIFICADOR 
+var clasificador = ee.Classifier.randomForest(50)
+                  .train(regiones_entrenamiento, 'clase', Nombre_bandas)
+                  .setOutputMode('PROBABILITY');
+                  
+//6 HACER LA MODELACIÓN
+var clasificacion = m00_18_multifecha.classify(clasificador);
+
+//Visualizacion
+Map.addLayer(mask_Bosque_2000,{'bands': ['B4', 'B5', 'B3'], 'min': 0, 'max': 6000},'Mosa_2000',false);
+Map.addLayer(mask_Bosque_2018,{'bands': ['B4', 'B5', 'B3'], 'min': 0, 'max': 6000},'Mosa_2018',false);
+Map.addLayer(clasificacion, {min: 0, max: 1, palette:["green","yellow"   ,"red" ]}, "Magnitud_degradación",false);
+
+//Export to asset
+Export.image.toAsset(
+  {image:clasificacion, 
+  description: 'magnitud_cambio', 
+  region:studyArea.bounds(), 
+  scale:30,
+  maxPixels: 1e12});
+  
